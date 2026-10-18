@@ -1,45 +1,21 @@
-// Fathom — the game. THIS IS THE FILE YOU IMPLEMENT.
+// Fathom — the game.
 //
-// `src/main.ts`, `src/constants.ts` and the project's configuration are supplied
-// with the project and stay as they are. What is missing is the game: the state it
-// holds, the debug surface that poses and reads that state, and the three
-// functions below.
+// This module declares the game's state, `FathomState`, exactly as
+// specs/state.md fixes it, the debug surface `FathomDebugApi` of
+// specs/instrumentation.md, and the `game` the engine drives. The work itself
+// lives beside it:
 //
-// FIRST, DECLARE AND EXPORT `FathomState`, exactly as `specs/state.md` fixes it,
-// and `FathomDebugApi`, the debug and automation surface `specs/instrumentation.md`
-// specifies. The stub below is written against both names, so this project does
-// not compile until they exist — the type check failing on a freshly seeded
-// workspace is the starting point, not a broken seed.
+//   world.ts     building mazes, dives, attempts and rosters; derived readings
+//   sim.ts       one fixed TICK_DT step of the simulation
+//   predators.ts the three hunters' senses and decisions
+//   sensing.ts   the forager's light, sonar, flares and the fog of war
+//   frame.ts     the per-frame update: input, screens, menus, ticks and cues
+//   render.ts    everything drawn
+//   debug.ts     the debug surface and the snapshot
 //
-// THEN IMPLEMENT the three functions. `initialize` runs once, when the engine is
-// initialized, and returns the state and the debug surface together, as the pair
-// `[state, debug]`. `update` and `render` then run once each per frame — `update`
-// first, with the frame's delta time in SECONDS, then `render`.
-//
-// The state is a VALUE, and every frame is a transition over it. The engine hands
-// `update` the current state as a read-only view (`DeepReadonly<FathomState>`)
-// and stores whatever `update` returns as the next state; `render` is handed
-// that next state, as the same read-only view, and returns nothing. Nothing ever
-// holds a writable `FathomState`: `update` builds the next state from the current
-// one (spread the parts that change, `map` over the arrays) rather than assigning
-// into it, and a frame that returns `undefined` is refused by the engine. The
-// engine's own documentation, seeded at `engine/`, defines all of this and the
-// scoped APIs each function receives; read it before you start.
-//
-// The engine returns the surface from `engine.debug`, exactly as `initialize`
-// handed it over, which is how the game is driven from code
-// (`specs/instrumentation.md`). Because no one holds a writable state, the
-// surface is written in the shape of `update`: a pose takes the current state and
-// returns the next (`setMaze(state, rows)`), a reading takes the state and
-// returns what it read (`snapshot(state)`), and a caller drives them through
-// `engine.apply` and `engine.state`. Where its implementation lives under `src/`
-// is your call; the only fixed point is that `initialize` returns it.
-//
-// The ART comes from the engine as well. The frames under `assets/` are loaded
-// through the engine's asset loader, which resolves a path under the `assets/`
-// root and against the page the build is served from — the engine's asset
-// documentation, seeded at `engine/`, defines the API, and `specs/assets.md`
-// states what each sheet holds and how a frame is drawn.
+// The state is a value. Every frame `update` copies the parts it changes into a
+// fresh draft (`draft` in world.ts), advances that, and returns it, so the
+// state the engine handed over is never written.
 
 import type {
   Game,
@@ -48,67 +24,418 @@ import type {
   UpdateApi,
 } from "@clockwyrks/simple-2d";
 import type { DeepReadonly } from "ts-essentials";
+import { loadArt } from "./art";
+import { defineCues } from "./audio";
+import { ACTIONS, BINDINGS, type PredatorKind } from "./constants";
+import { createDebugApi, registerDiagnostics } from "./debug";
+import { advanceFrame } from "./frame";
+import { renderGame } from "./render";
+import { initialState } from "./world";
+
+// ---- The state (specs/state.md) -------------------------------------------
+
+export type Screen =
+  | "title"
+  | "howto"
+  | "countdown"
+  | "playing"
+  | "paused"
+  | "cleared"
+  | "gameover";
+
+export type Dir = "up" | "down" | "left" | "right";
+
+export type PredatorState = "den" | "wander" | "chase" | "search";
+
+export type PulseSource = "forager" | "gloamfin";
+
+export type PulseTint = "cyan" | "violet" | "orange";
+
+export interface TilePos {
+  readonly tx: number;
+  readonly ty: number;
+}
+
+/** The tile grid's fixed frame. */
+export interface GridFrame {
+  readonly cols: number;
+  readonly rows: number;
+  readonly tile: number;
+  readonly originX: number;
+  readonly originY: number;
+}
+
+export interface SonarState {
+  /** `true` exactly when `cooldown` is `0`. */
+  ready: boolean;
+  /** Seconds until the next pulse may be emitted. */
+  cooldown: number;
+  /** `E`, the pulse's path range in tiles at the current depth. */
+  range: number;
+}
+
+export interface InkState {
+  ready: boolean;
+  cooldown: number;
+}
+
+export interface Forager {
+  /** Its center, in logical units. */
+  x: number;
+  y: number;
+  /** The tile whose bounds contain its center. */
+  tx: number;
+  ty: number;
+  /** Its facing, moving or at rest. */
+  dir: Dir;
+  moving: boolean;
+  /** The buffered desired direction the movement actions set. */
+  desired: Dir | null;
+}
+
+export interface Drifter {
+  x: number;
+  y: number;
+  tx: number;
+  ty: number;
+  /** Whether its body is drawn this instant. */
+  lit: boolean;
+  /** Whether it decides its own wander. */
+  mind: boolean;
+  /** Whether its body carries those decisions through the maze. */
+  travel: boolean;
+  /** Its heading along the corridor. */
+  dir: Dir;
+}
+
+/** Where a Flarefish's flare stands. */
+export type FlarePhase = "idle" | "charge" | "bloom";
+
+export interface Predator {
+  kind: PredatorKind;
+  x: number;
+  y: number;
+  tx: number;
+  ty: number;
+  dir: Dir;
+  state: PredatorState;
+  released: boolean;
+  mind: boolean;
+  travel: boolean;
+  /** The rate it travels at in its current state. */
+  speed: number;
+  alert: boolean;
+  lit: boolean;
+  detectRange: number | null;
+  hearingRange: number | null;
+  hearingLock: boolean | null;
+  flareCharging: boolean | null;
+  flaring: boolean | null;
+  flareRadius: number | null;
+
+  /** Seconds of live play after which its den slot arrives; `null` for none. */
+  releaseAt: number | null;
+  /** The tile it believes the forager is on, while it holds a fix. */
+  fix: TilePos | null;
+  /** Seconds left on a lapsed fix's linger, or `null` while not lingering. */
+  linger: number | null;
+  /** Seconds left on the detection alert. */
+  alertLeft: number;
+  /** Seconds left on a sonar mark. */
+  markLeft: number;
+  /** The Gloamfin's chase speed, which corners cost it. */
+  chaseSpeed: number;
+  /** The Gloamfin's ping timer. */
+  pingTimer: number;
+  /** Seconds since the Gloamfin's last ping. */
+  sincePing: number;
+  /** Seconds into the Gloamfin's current search. */
+  searchTime: number;
+  /** Whether this search has cast its guaranteed ping. */
+  searchPinged: boolean;
+  /** The Flarefish's flare timer. */
+  flareTimer: number;
+  flarePhase: FlarePhase;
+  /** Seconds left on the current charge or bloom. */
+  flareLeft: number;
+  /** Seconds left on the bloom art's fade, which lights nothing. */
+  fadeLeft: number;
+}
+
+export interface Pulse {
+  source: PulseSource;
+  tint: PulseTint;
+  /** The tile it originated from. */
+  ox: number;
+  oy: number;
+  /** How far the front has traveled, in corridor steps. */
+  front: number;
+  /** The furthest it travels, in corridor steps. */
+  range: number;
+  /** Path distance from the origin per tile, `-1` where it cannot flow. */
+  dist: readonly number[];
+  /** The predator index that cast a Gloamfin ping. */
+  owner: number | null;
+  /** Whether this ping has already caught the forager. */
+  caught: boolean;
+  /** Predator indices whose tile this front has already reached. */
+  reached: readonly number[];
+}
+
+export interface InkCloud {
+  x: number;
+  y: number;
+  radius: number;
+  remaining: number;
+}
+
+/** An in-progress pointer or touch press on a menu or the how-to screen. */
+export interface MenuPress {
+  readonly id: number;
+  readonly screen: Screen;
+  readonly item: number | null;
+}
+
+/** The sprite sheets, one bitmap per frame, as specs/assets.md lays them out. */
+export interface Art {
+  readonly forager: readonly ImageBitmap[];
+  readonly lanternjaw: readonly ImageBitmap[];
+  readonly gloamfin: readonly ImageBitmap[];
+  readonly flarefish: readonly ImageBitmap[];
+  readonly drifter: readonly ImageBitmap[];
+  readonly bloom: readonly ImageBitmap[];
+  readonly tiles: readonly ImageBitmap[];
+}
+
+export interface FathomState {
+  screen: Screen;
+  menuIndex: number | null;
+  titleIndex: number;
+  depth: number;
+  score: number;
+  lives: number;
+  muted: boolean;
+  planktonRemaining: number;
+  drifterIn: number;
+  brightness: number;
+  brightHold: number;
+  visionRadius: number;
+  windowRadius: number;
+  sonar: SonarState;
+  ink: InkState;
+  grid: GridFrame;
+  /** The layout: `#` rock, `.` corridor, `g` gate, `d` den interior. */
+  tiles: readonly string[];
+  /** `*` where a plankton stands, `-` elsewhere. */
+  plankton: readonly string[];
+  /** `u` unrevealed, `r` remembered, `l` lit. */
+  visibility: readonly string[];
+  forager: Forager;
+  drifters: Drifter[];
+  predators: Predator[];
+  pulses: Pulse[];
+  inkClouds: InkCloud[];
+  simTime: number;
+
+  // Beyond the observable fields: what the simulation carries between frames.
+
+  /** Frame time not yet consumed by a whole tick. */
+  accumulator: number;
+  /** Seconds left on the countdown or the cleared interstitial. */
+  screenTimer: number;
+  /** Seconds of live play in the current attempt: the release clock. */
+  playTime: number;
+  /** The forager's start tile in the current maze. */
+  start: TilePos;
+  /** The random generator's state. */
+  rng: number;
+  press: MenuPress | null;
+  /** The art, or `null` where it could not be loaded. */
+  art: Art | null;
+}
+
+// ---- The snapshot (specs/state.md) ----------------------------------------
+
+export interface FathomSnapshot {
+  version: number;
+  screen: Screen;
+  menuIndex: number | null;
+  titleIndex: number;
+  depth: number;
+  score: number;
+  lives: number;
+  muted: boolean;
+  planktonRemaining: number;
+  drifterIn: number;
+  brightness: number;
+  brightHold: number;
+  visionRadius: number;
+  windowRadius: number;
+  sonar: { ready: boolean; cooldown: number; range: number };
+  ink: { ready: boolean; cooldown: number };
+  grid: {
+    cols: number;
+    rows: number;
+    tile: number;
+    originX: number;
+    originY: number;
+  };
+  tiles: string[];
+  plankton: string[];
+  visibility: string[];
+  forager: {
+    x: number;
+    y: number;
+    tx: number;
+    ty: number;
+    dir: Dir;
+    moving: boolean;
+  };
+  drifters: {
+    x: number;
+    y: number;
+    tx: number;
+    ty: number;
+    lit: boolean;
+    mind: boolean;
+    travel: boolean;
+  }[];
+  predators: {
+    kind: PredatorKind;
+    x: number;
+    y: number;
+    tx: number;
+    ty: number;
+    dir: Dir;
+    state: PredatorState;
+    released: boolean;
+    mind: boolean;
+    travel: boolean;
+    speed: number;
+    alert: boolean;
+    lit: boolean;
+    detectRange: number | null;
+    hearingRange: number | null;
+    hearingLock: boolean | null;
+    flareCharging: boolean | null;
+    flaring: boolean | null;
+    flareRadius: number | null;
+  }[];
+  pulses: {
+    source: PulseSource;
+    tint: PulseTint;
+    ox: number;
+    oy: number;
+    front: number;
+    range: number;
+  }[];
+  inkClouds: { x: number; y: number; radius: number; remaining: number }[];
+  simTime: number;
+}
+
+/** A menu item's hit region, in logical units. */
+export interface Rect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+// ---- The debug surface (specs/instrumentation.md) -------------------------
+
+type View = DeepReadonly<FathomState>;
+
+export interface FathomDebugApi {
+  readonly version: number;
+  reset(state: View): FathomState;
+  snapshot(state: View): FathomSnapshot;
+  reconcile(state: View): FathomState;
+  setScreen(state: View, s: Screen): FathomState;
+  setMenuIndex(state: View, index: number): FathomState;
+  setTitleIndex(state: View, index: number): FathomState;
+  menuItemRect(state: View, index: number): Rect | null;
+  setScore(state: View, points: number): FathomState;
+  setLives(state: View, n: number): FathomState;
+  setDepth(state: View, d: number): FathomState;
+  setMaze(state: View, rows: readonly string[]): FathomState;
+  setPlankton(
+    state: View,
+    tx: number,
+    ty: number,
+    present: boolean,
+  ): FathomState;
+  clearPlankton(state: View): FathomState;
+  clearFog(state: View): FathomState;
+  setForagerTile(state: View, tx: number, ty: number): FathomState;
+  setForagerDir(state: View, dir: Dir): FathomState;
+  setBrightness(state: View, g: number): FathomState;
+  setBrightHold(state: View, seconds: number): FathomState;
+  clearPredators(state: View): FathomState;
+  addPredator(
+    state: View,
+    kind: PredatorKind,
+    tx: number,
+    ty: number,
+  ): FathomState;
+  setPredatorTile(
+    state: View,
+    index: number,
+    tx: number,
+    ty: number,
+  ): FathomState;
+  setPredatorDir(state: View, index: number, dir: Dir): FathomState;
+  setPredatorState(
+    state: View,
+    index: number,
+    value: "den" | "wander" | "chase",
+  ): FathomState;
+  setPredatorReleased(
+    state: View,
+    index: number,
+    released: boolean,
+  ): FathomState;
+  setPredatorMind(state: View, index: number, enabled: boolean): FathomState;
+  setPredatorTravel(state: View, index: number, enabled: boolean): FathomState;
+  spawnDrifter(state: View, tx: number, ty: number): FathomState;
+  clearDrifters(state: View): FathomState;
+  setDrifterMind(state: View, index: number, enabled: boolean): FathomState;
+  setDrifterTravel(state: View, index: number, enabled: boolean): FathomState;
+  setDrifterIn(state: View, seconds: number): FathomState;
+  setSonarCooldown(state: View, seconds: number): FathomState;
+  setInkCooldown(state: View, seconds: number): FathomState;
+}
+
+// ---- The game ---------------------------------------------------------------
 
 /**
- * The stage background, a CSS color string. `src/main.ts` hands it to the engine
- * as the color the canvas is cleared to each frame, so the letterbox bars around
- * the stage match the water itself. This placeholder is replaced by the build
- * with the color its trench uses.
+ * The stage background: the abyss itself, matched to the unrevealed fog tile so
+ * the letterbox bars, the fog and the water read as one darkness.
  */
-export const BACKGROUND = "#000";
+export const BACKGROUND = "#03060c";
 
-const NOT_IMPLEMENTED = "Fathom: src/game.ts is not implemented yet";
-
-/**
- * The game this build's engine drives.
- *
- * Implement all three functions. Nothing else in the project needs changing for
- * the game to run: `src/main.ts` already binds this object to the engine.
- */
 export const game: Game<FathomState, FathomDebugApi> = {
-  /**
-   * Runs once, before any frame.
-   *
-   * Register every action in ACTIONS against its BINDINGS, define the seven CUES,
-   * load the frames of the sheets specs/assets.md lists, register the diagnostic
-   * sources specs/instrumentation.md lists — each is handed the state current at
-   * the read, so none closes over the state built here — and build the complete
-   * initial state: the title screen, with every field of FathomState set. Return
-   * it beside the debug surface.
-   */
-  initialize(_api: InitApi<FathomState>): [FathomState, FathomDebugApi] {
-    throw new Error(NOT_IMPLEMENTED);
+  async initialize(
+    api: InitApi<FathomState>,
+  ): Promise<[FathomState, FathomDebugApi]> {
+    for (const name of ACTIONS) {
+      api.input.register(name, { keys: [...BINDINGS[name]] });
+    }
+    defineCues(api.audio);
+    registerDiagnostics(api.diagnostics);
+    const art = await loadArt(api.assets);
+    const seed = Math.floor(Math.random() * 0x100000000);
+    return [initialState(seed, art), createDebugApi()];
   },
 
-  /**
-   * Runs once per frame, before `render`: the next state, from the current one.
-   *
-   * `dt` is the real elapsed SECONDS of this frame, and specs/movement.md fixes
-   * the simulation at TICK_HZ steps of TICK_DT each, so a frame advances the
-   * whole ticks its delta completes and carries the remainder into the next one.
-   * `simTime` accumulates the time those ticks cover, on every screen. Read
-   * input, advance the simulation, play cues, and mirror the engine's mute bit
-   * into the returned state's `muted`. The value returned is what `render` draws
-   * and what the next `update` receives; `state` itself is read-only and stays as
-   * it was.
-   */
   update(
-    _state: DeepReadonly<FathomState>,
-    _api: UpdateApi,
-    _dt: number,
+    state: DeepReadonly<FathomState>,
+    api: UpdateApi,
+    dt: number,
   ): FathomState {
-    throw new Error(NOT_IMPLEMENTED);
+    return advanceFrame(state, api, dt);
   },
 
-  /**
-   * Runs once per frame, after `update`, with the state `update` returned.
-   *
-   * `api.ctx` arrives cleared and already carrying the logical transform, so draw
-   * in 1280x720 coordinates and never read the canvas element's size. The state
-   * arrives read-only, so the type is what guarantees that rendering changes
-   * nothing.
-   */
-  render(_state: DeepReadonly<FathomState>, _api: RenderApi): void {
-    throw new Error(NOT_IMPLEMENTED);
+  render(state: DeepReadonly<FathomState>, api: RenderApi): void {
+    renderGame(state, api.ctx);
   },
 };

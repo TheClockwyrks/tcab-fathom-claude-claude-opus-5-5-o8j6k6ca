@@ -1,0 +1,11 @@
+[[media]]
+file = "dive.json.gz"
+name = "Pinging a dark corridor as a Flarefish blooms"
+
+[[media]]
+file = "flare.png"
+name = "A flare burns the maze open"
+
+[[media]]
+file = "title.png"
+name = "The title screen"
